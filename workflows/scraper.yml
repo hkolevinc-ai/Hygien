@@ -1,1 +1,66 @@
+name: Scrape Hygiene.bg for Temu
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "all_site"
+        type: choice
+        options:
+          - all_site
+          - single_product
+          - category
+          - sitemap
+      url:
+        description: "Seed URL: sitemap/category/product"
+        required: true
+        default: "https://hygiene.bg/sitemap_index.xml"
+      limit:
+        description: "0 = all products; use 20 for test"
+        required: true
+        default: "20"
+      delay:
+        description: "Delay between requests in seconds"
+        required: true
+        default: "0.6"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        run: |
+          python scraper.py \
+            --mode "${{ github.event.inputs.mode }}" \
+            --url "${{ github.event.inputs.url }}" \
+            --limit "${{ github.event.inputs.limit }}" \
+            --delay "${{ github.event.inputs.delay }}" \
+            --template "TEMU_GENERAL_UPLOAD_TEMPLATE.xlsx" \
+            --output "TEMU_HYGIENE_UPLOAD.xlsx" \
+            --raw-output "hygiene_raw_export.csv"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: temu-hygiene-upload
+          path: |
+            TEMU_HYGIENE_UPLOAD.xlsx
+            hygiene_raw_export.csv
 
