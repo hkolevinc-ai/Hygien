@@ -140,6 +140,43 @@ def unique_keep_order(items: Iterable[str]) -> list[str]:
     return out
 
 
+def slugify_sku_part(value: str, max_len: int = 28) -> str:
+    """Make a compact suffix for duplicate SKU values."""
+    value = clean_text(value)
+    value = value.replace("№", "no")
+    value = re.sub(r"[^0-9A-Za-zА-Яа-я._-]+", "-", value, flags=re.U).strip("-_.")
+    return value[:max_len] or "variant"
+
+
+def ensure_unique_seller_skus(rows: list[ProductRow]) -> list[ProductRow]:
+    """Temu is stricter than WooCommerce: each row/SKU should be unique.
+
+    Hygiene.bg sometimes uses the same SKU for several variations or even different
+    products. Keep the first SKU as-is, and append a readable suffix to later duplicates.
+    """
+    seen: set[str] = set()
+    used_counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        base = clean_text(row.seller_sku or row.listing_id or slug_from_url(row.product_url))
+        if base and base not in seen:
+            row.seller_sku = base
+            seen.add(base)
+            used_counts[base] += 1
+            continue
+
+        used_counts[base] += 1
+        suffix_source = row.variation_variant_1 or row.item_name or str(used_counts[base])
+        suffix = slugify_sku_part(suffix_source)
+        candidate = f"{base}-{suffix}" if base else suffix
+        i = 2
+        while candidate in seen:
+            candidate = f"{base}-{suffix}-{i}" if base else f"{suffix}-{i}"
+            i += 1
+        row.seller_sku = candidate
+        seen.add(candidate)
+    return rows
+
+
 def get_meta(soup: BeautifulSoup, prop: str) -> str:
     tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
     return clean_text(tag.get("content")) if tag and tag.get("content") else ""
@@ -274,6 +311,13 @@ def extract_description_and_notes(soup: BeautifulSoup) -> tuple[str, list[str]]:
                 note_candidates.append(txt)
 
     description = "\n\n".join(unique_keep_order(parts)).strip()
+    # Fallback for products with no visible WooCommerce description tab.
+    # Use meta description/OG description instead of leaving Temu description blank.
+    if not description:
+        fallback_description = clean_text(get_meta(soup, "og:description") or get_meta(soup, "description"))
+        if fallback_description:
+            description = fallback_description
+            note_candidates.append(fallback_description)
 
     notes = []
     for candidate in note_candidates:
@@ -432,9 +476,10 @@ def extract_product_rows_from_html(page_html: str, source_url: str = "") -> list
             if not var_pairs:
                 var_pairs = [("Вариант", str(idx))]
 
-            size_display, net_content, net_unit = find_size(" ".join(v for _, v in var_pairs) + " " + title + " " + description)
-            if not net_content:
-                size_display, net_content, net_unit = find_size(title + " " + description)
+            # For variable products, look at the actual variation value and product title.
+            # Avoid scanning the full description to prevent unrelated capacities/weights from
+            # being exported as net content.
+            size_display, net_content, net_unit = find_size(" ".join(v for _, v in var_pairs) + " " + title)
 
             price = var.get("display_price")
             try:
@@ -484,8 +529,11 @@ def extract_product_rows_from_html(page_html: str, source_url: str = "") -> list
             rows.append(row)
         return rows
 
-    # Simple product: use product volume/weight from title/description as its variant when possible.
-    size_display, net_content, net_unit = find_size(title + " " + description)
+    # Simple product: infer product net content from the TITLE only.
+    # Do not scan the full description here, because many non-liquid products mention
+    # capacities/weights (e.g. vacuum bag capacity, machine weight) that are not actual
+    # sellable variation values.
+    size_display, net_content, net_unit = find_size(title)
     variation_type = "Обем" if size_display else "Вариант"
     variation_value = size_display or "Стандартен"
 
@@ -789,6 +837,8 @@ def main() -> int:
             urls = scraper.discover_all_site()
         logging.info("Discovered %s product URLs", len(urls))
         rows = scraper.scrape_products(urls, limit=args.limit)
+
+    rows = ensure_unique_seller_skus(rows)
 
     logging.info("Exporting %s SKU rows", len(rows))
     if not rows:
