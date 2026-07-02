@@ -145,6 +145,30 @@ def get_meta(soup: BeautifulSoup, prop: str) -> str:
     return clean_text(tag.get("content")) if tag and tag.get("content") else ""
 
 
+def is_real_product_page(soup: BeautifulSoup) -> bool:
+    """Return True only for actual WooCommerce product pages, not blog/category pages.
+
+    Hygiene.bg uses root-level slugs for both products and blog posts, so URL shape alone
+    is not enough. This guard prevents blog articles that contain product cards from being
+    exported as products.
+    """
+    og_type = get_meta(soup, "og:type").lower()
+    if og_type == "product":
+        return True
+
+    body_classes = set(soup.body.get("class", [])) if soup.body else set()
+    if "single-product" in body_classes or "product-template-default" in body_classes:
+        return True
+
+    if soup.select_one("h1.product_title") and (
+        soup.select_one("form.cart, form.variations_form, .product_meta, .woocommerce-product-gallery")
+        or get_meta(soup, "product:price:amount")
+    ):
+        return True
+
+    return False
+
+
 def canonical_url(soup: BeautifulSoup, fallback: str = "") -> str:
     link = soup.find("link", rel="canonical")
     if link and link.get("href"):
@@ -154,20 +178,25 @@ def canonical_url(soup: BeautifulSoup, fallback: str = "") -> str:
 
 
 def extract_title(soup: BeautifulSoup) -> str:
-    h1 = soup.select_one("h1.product_title, h1.entry-title")
+    # Use the WooCommerce product title only. Blog/article titles are intentionally ignored
+    # by the product-page guard, but this also avoids mixing article titles into product rows.
+    h1 = soup.select_one("h1.product_title")
     if h1:
         return clean_text(h1.get_text(" "), 500)
     return clean_text(get_meta(soup, "og:title") or (soup.title.get_text(" ") if soup.title else ""), 500)
 
 
 def extract_brand(soup: BeautifulSoup) -> str:
+    # Prefer Yoast/WooCommerce product metadata. Do NOT read .pwb-brands-in-loop because
+    # that selector also appears in blog pages with product cards and caused product names
+    # to be exported as brands.
     brand = get_meta(soup, "product:brand")
     if brand:
         return brand
-    link = soup.select_one(".pwb-single-product-brands a[title], .pwb-brands-in-loop a[title]")
+    link = soup.select_one(".summary .pwb-single-product-brands a[title], .pwb-single-product-brands a[title]")
     if link and link.get("title"):
         return clean_text(link.get("title"))
-    img = soup.select_one(".pwb-single-product-brands img[alt], .pwb-brands-in-loop img[alt]")
+    img = soup.select_one(".summary .pwb-single-product-brands img[alt], .pwb-single-product-brands img[alt]")
     return clean_text(img.get("alt")) if img and img.get("alt") else ""
 
 
@@ -206,35 +235,50 @@ def extract_categories(soup: BeautifulSoup) -> list[str]:
     return unique_keep_order(cats)
 
 
+def clean_multiline_text(element: Any) -> str:
+    """Clean HTML into plain text while preserving paragraph/list boundaries."""
+    if not element:
+        return ""
+    clone = BeautifulSoup(str(element), "lxml")
+    for bad in clone.select("script, style, img, noscript, form, button"):
+        bad.decompose()
+    # Add line breaks around common block elements before extracting text.
+    for br in clone.find_all("br"):
+        br.replace_with("\n")
+    for tag in clone.find_all(["p", "li", "tr", "h2", "h3", "h4"]):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+    text = html.unescape(clone.get_text("\n"))
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return "\n".join(unique_keep_order(lines))
+
+
 def extract_description_and_notes(soup: BeautifulSoup) -> tuple[str, list[str]]:
     parts = []
     note_candidates = []
 
-    short = soup.select_one(".woocommerce-product-details__short-description")
-    if short:
-        text = clean_text(short.get_text(" "))
+    # Short description first, then the full WooCommerce description tab. Keep full text;
+    # do not truncate to 2000 chars because the user wants the full product description.
+    for selector in (".woocommerce-product-details__short-description", "#tab-description", ".woocommerce-Tabs-panel--description"):
+        element = soup.select_one(selector)
+        if not element:
+            continue
+        text = clean_multiline_text(element)
         if text:
             parts.append(text)
             note_candidates.append(text)
-
-    desc = soup.select_one("#tab-description, .woocommerce-Tabs-panel--description")
-    if desc:
-        for img in desc.select("img, script, style"):
-            img.decompose()
-        for li in desc.select("li"):
-            txt = clean_text(li.get_text(" "))
+        for li in element.select("li"):
+            txt = clean_text(li.get_text(" "), 700)
             if txt and len(txt) > 3:
                 note_candidates.append(txt)
-        text = clean_text(desc.get_text(" "))
-        if text:
-            parts.append(text)
 
-    description = clean_text("\n".join(unique_keep_order(parts)), 2000)
+    description = "\n\n".join(unique_keep_order(parts)).strip()
 
     notes = []
     for candidate in note_candidates:
         # Split very long candidate into sentences for bullet points.
-        splits = re.split(r"(?<=[.!?])\s+|\s*[•\-–]\s+", candidate)
+        splits = re.split(r"(?<=[.!?])\s+|\s*[•\-–]\s+", candidate.replace("\n", " "))
         for item in splits:
             item = clean_text(item, 700)
             if len(item) >= 10 and item not in notes:
@@ -354,6 +398,9 @@ def extract_base_price(soup: BeautifulSoup) -> Optional[float]:
 
 def extract_product_rows_from_html(page_html: str, source_url: str = "") -> list[ProductRow]:
     soup = BeautifulSoup(page_html, "lxml")
+    if not is_real_product_page(soup):
+        logging.info("Skipping non-product page: %s", source_url or canonical_url(soup))
+        return []
     url = canonical_url(soup, source_url)
     title = extract_title(soup)
     base_sku = extract_sku(soup) or slug_from_url(url)
@@ -496,7 +543,9 @@ class Scraper:
         for loc in locs:
             low = loc.lower()
             if low.endswith(".xml"):
-                if any(key in low for key in ["product", "sitemap", "post"]):
+                # Only product sitemaps should be traversed. Post/page/category sitemaps may
+                # contain blog articles with product cards, which must not become product rows.
+                if "product-sitemap" in low and "product_cat" not in low:
                     child_sitemaps.append(loc)
             elif self.is_probable_product_url(loc):
                 urls.append(loc)
