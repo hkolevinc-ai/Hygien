@@ -1,0 +1,5 @@
+*.xlsx
+!TEMU_GENERAL_UPLOAD_TEMPLATE.xlsx
+*.csv
+__pycache__/
+.env
