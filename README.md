@@ -68,3 +68,14 @@ python scraper.py --mode category --url "https://hygiene.bg/cat/pochistvasti-pre
 4. Натисни **Run workflow**.
 5. За тест остави `limit: 20`; за целия сайт сложи `limit: 0`.
 6. След края свали artifacts: `temu-hygiene-upload`.
+
+## Fix v2
+
+This version skips blog/article pages even when they appear in a sitemap or contain product cards. A page is exported only when it is a real WooCommerce product page (`og:type=product`, `single-product`, or product form/gallery metadata).
+
+Changes:
+- product sitemap discovery no longer crawls post/page sitemaps;
+- blog pages are ignored during scrape;
+- product name is written to `item_name` / Product Name;
+- brand is read only from product metadata/product brand blocks, not listing cards;
+- full WooCommerce product description is written to `item_description` without the previous 2000-character truncation.
